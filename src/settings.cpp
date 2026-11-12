@@ -34,6 +34,7 @@ std::string Settings::serialize() const {
       << "period_frames=" << periodFrames << "\n"
       << "exclusive_in=" << exclusiveIn << "\n"
       << "exclusive_out=" << exclusiveOut << "\n"
+      << "direct_engine=" << directEngine << "\n"
       << "safety_frames=" << safetyFrames << "\n"
       << "gain_db=" << gainDb << "\n"
       << "muted=" << muted << "\n"
@@ -67,6 +68,7 @@ void Settings::parse(const std::string& text) {
         else if (k == "period_frames") I(periodFrames);
         else if (k == "exclusive_in") B(exclusiveIn);
         else if (k == "exclusive_out") B(exclusiveOut);
+        else if (k == "direct_engine") B(directEngine);
         else if (k == "safety_frames") I(safetyFrames);
         else if (k == "gain_db") F(gainDb);
         else if (k == "muted") B(muted);

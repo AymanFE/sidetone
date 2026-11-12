@@ -21,7 +21,9 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -37,6 +39,7 @@ static EngineConfig toConfig(const Settings& s) {
     c.periodFrames = (uint32_t)s.periodFrames;
     c.exclusiveIn = s.exclusiveIn;
     c.exclusiveOut = s.exclusiveOut;
+    c.direct = s.directEngine;
     return c;
 }
 
@@ -62,16 +65,18 @@ static void printUsage() {
         "  Sidetone --list          list audio backends and devices\n"
         "  Sidetone --headless      run without a window (uses saved settings)\n"
         "     --input \"name\"   --output \"name\"   --period N   --rate N\n"
+        "  Sidetone --measure       measure real latency (needs output looped back into the mic)\n"
         "     --gain dB   --exclusive | --exclusive-in | --exclusive-out   --backend NAME\n");
 }
 
 static int runCli(int argc, char** argv, Settings& s) {
-    bool list = false, headless = false;
+    bool list = false, headless = false, measure = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--list") list = true;
         else if (a == "--headless") headless = true;
+        else if (a == "--measure") measure = headless = true;
         else if (a == "--input") s.input = next();
         else if (a == "--output") s.output = next();
         else if (a == "--period") s.periodFrames = std::atoi(next().c_str());
@@ -81,6 +86,7 @@ static int runCli(int argc, char** argv, Settings& s) {
         else if (a == "--exclusive") s.exclusiveIn = s.exclusiveOut = true;
         else if (a == "--exclusive-in") s.exclusiveIn = true;
         else if (a == "--exclusive-out") s.exclusiveOut = true;
+        else if (a == "--no-direct") s.directEngine = false;
         else { printUsage(); return a == "--help" || a == "-h" ? 0 : 1; }
     }
     auto eng = std::make_unique<Engine>();
@@ -105,6 +111,21 @@ static int runCli(int argc, char** argv, Settings& s) {
     std::printf("Mic period %u fr%s, output period %u x %u fr%s\n", in.capPeriod, in.capExclusive ? " (exclusive)" : "",
                 in.playPeriod, in.playPeriods, in.playExclusive ? " (exclusive)" : "");
     if (!in.note.empty()) std::printf("Note: %s\n", in.note.c_str());
+    if (in.playBuffer) std::printf("WASAPI buffers: mic %u fr, out %u fr (rates %u / %u)%s%s\n", in.capBuffer, in.playBuffer,
+                                   in.capInternalRate, in.playInternalRate, in.capLowLatency ? " mic-LL" : "", in.playLowLatency ? " out-LL" : "");
+    if (measure) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        eng->startLatencyTest();
+        while (eng->latencyTestState() == 1) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (eng->latencyTestState() == 2)
+            std::printf("MEASURED mic->ear latency: %.2f ms (min %.2f, max %.2f) | estimate %.2f ms | cushion %u underruns %llu | out margin %u glitches %llu\n",
+                        eng->measuredLatencyMs(), eng->measuredMinMs(), eng->measuredMaxMs(), eng->estimatedLatencyMs(),
+                        eng->cushionFrames(), (unsigned long long)eng->underruns(), eng->outputMargin(),
+                        (unsigned long long)eng->outputGlitches());
+        else std::printf("Measurement failed: no loopback detected (put the headphones on the mic or use a loopback cable).\n");
+        eng->stop();
+        return eng->latencyTestState() == 2 ? 0 : 2;
+    }
     std::printf("Press Enter to stop.\n");
     std::fflush(stdout);
     std::atomic<bool> quit{false};
@@ -235,7 +256,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 #endif
     glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
-    GLFWwindow* win = glfwCreateWindow(520, 860, "Sidetone", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(520, 960, "Sidetone", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -324,7 +345,7 @@ int main(int argc, char** argv) {
         bool on = eng.running();
         ImGui::TextColored(on ? ImVec4(0.35f, 0.9f, 0.5f, 1) : ImVec4(0.7f, 0.7f, 0.7f, 1), on ? "LIVE" : "OFF");
         ImGui::SameLine();
-        if (on) ImGui::Text("  ~%.1f ms buffer latency", eng.estimatedLatencyMs());
+        if (on) ImGui::Text("  ~%.1f ms software latency (est.)", eng.estimatedLatencyMs());
         else ImGui::TextDisabled("  %s", status.c_str());
 
         // Big toggle
@@ -408,17 +429,40 @@ int main(int argc, char** argv) {
         ImGui::SameLine(0, 24 * uiScale);
         ImGui::Checkbox("Exclusive output", &s.exclusiveOut);
         help("Lowest latency: Sidetone takes the output device exclusively.\nWARNING: no other app can play sound on that device while it's on.\nBest with a dedicated output (e.g. a headset's separate 'chat' endpoint).");
+#ifdef _WIN32
+        ImGui::Checkbox("Direct WASAPI engine", &s.directEngine);
+        help("Windows shared mode: Sidetone's own WASAPI engine. Keeps the output queue at one\nWindows engine period + ~1.5 ms instead of a full buffer (saves ~5-10 ms) and uses\nWindows' low-latency audio periods when the driver supports them.\nTurn off only if you get problems.");
+#endif
 
         if (on) {
             auto& in = eng.info();
-            ImGui::TextDisabled("%s | mic block %u fr%s | out %u x%u fr%s", in.backend.c_str(), in.capPeriod,
-                                in.capExclusive ? " (excl)" : "", in.playPeriod, in.playPeriods,
-                                in.playExclusive ? " (excl)" : "");
-            ImGui::TextDisabled("fill %.0f fr | auto cushion %u fr | underruns %llu | trimmed %llu fr", eng.avgFillFrames(),
-                                eng.cushionFrames(), (unsigned long long)eng.underruns(),
-                                (unsigned long long)eng.droppedFrames());
+            auto ms = [](uint32_t fr, uint32_t rate) { return rate ? fr * 1000.0 / rate : 0.0; };
+            ImGui::TextDisabled("%s | mic block %.2f ms%s%s | out period %.2f ms%s%s", in.backend.c_str(),
+                                ms(in.capPeriod, in.capInternalRate), in.capExclusive ? " excl" : "",
+                                in.capLowLatency ? " LL" : "", ms(in.playPeriod, in.playInternalRate),
+                                in.playExclusive ? " excl" : "", in.playLowLatency ? " LL" : "");
+            if (in.direct)
+                ImGui::TextDisabled("ring %.0f fr | cushion %u fr | out margin %u fr | underruns %llu | out glitches %llu",
+                                    eng.avgFillFrames(), eng.cushionFrames(), eng.outputMargin(),
+                                    (unsigned long long)eng.underruns(), (unsigned long long)eng.outputGlitches());
+            else
+                ImGui::TextDisabled("ring %.0f fr | cushion %u fr | underruns %llu | trimmed %llu fr", eng.avgFillFrames(),
+                                    eng.cushionFrames(), (unsigned long long)eng.underruns(),
+                                    (unsigned long long)eng.droppedFrames());
             if (!in.note.empty()) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%s", in.note.c_str());
         }
+
+        // Real measurement
+        int ts = eng.latencyTestState();
+        ImGui::BeginDisabled(!on || ts == 1);
+        if (ImGui::Button(ts == 1 ? "Measuring..." : "Measure real latency")) eng.startLatencyTest();
+        ImGui::EndDisabled();
+        help("Measures the true mic-to-ear delay (including the hardware).\n1. Press an earcup / speaker right against the mic, volume up.\n2. Click and stay quiet ~3 s (you'll hear a few beeps).");
+        if (ts != 0) ImGui::SameLine();
+        if (ts == 1) ImGui::Text("%d / %d", eng.latencyTestRuns(), Engine::kTestRuns);
+        else if (ts == 2) ImGui::TextColored(ImVec4(0.35f, 0.9f, 0.5f, 1), "%.1f ms  (%.1f-%.1f)", eng.measuredLatencyMs(),
+                                             eng.measuredMinMs(), eng.measuredMaxMs());
+        else if (ts == 3) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "No beep heard - put the earcup on the mic");
 
         ImGui::SeparatorText("Clean-up (zero added latency)");
         ImGui::Checkbox("Low-cut", &s.hpf);

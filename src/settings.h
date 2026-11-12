@@ -9,6 +9,7 @@ struct Settings {
     int periodFrames = 64;
     bool exclusiveIn = false;
     bool exclusiveOut = false;
+    bool directEngine = true;
     int safetyFrames = 16;
 
     float gainDb = 0.0f;

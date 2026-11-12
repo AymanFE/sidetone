@@ -19,6 +19,8 @@ Grab the latest build from **[Releases](../../releases/latest)**:
 - Pick **any microphone** and **any output** (headset, speakers, virtual cable…), switch live
 - Volume (-40…+24 dB), mute, left/right balance, mic channel select (for one-sided USB mics)
 - **Low-latency engine**
+  - Windows: **direct WASAPI engine** — writes mic audio to the output the instant it's captured and keeps the output queue at exactly *one Windows engine period + ~1.5 ms* (adaptive) instead of a full buffer. Uses IAudioClient3 low-latency periods when the driver supports them. Measured ~10–13 ms less than a normal WASAPI client on the same hardware.
+  - **Measure real latency** button: plays a short beep into the sidetone path and times how long it takes to come back through the mic — the true mic-to-ear delay, hardware included
   - miniaudio with low-latency profile, no fixed-size callback buffering, real-time audio threads (MMCSS "Pro Audio" on Windows)
   - Windows: IAudioClient3 low-latency shared mode when the driver supports it, optional **exclusive mode** per device
   - Linux: ALSA / PulseAudio / PipeWire / **JACK** selectable; macOS: CoreAudio
@@ -38,6 +40,13 @@ Grab the latest build from **[Releases](../../releases/latest)**:
 4. Linux: choose **JACK** as the Audio API (works with PipeWire's JACK layer).
 5. Watch the stats line: *mic block* / *out* show what the driver actually granted.
 
+### Where the delay comes from (Windows shared mode)
+
+`mic block` + `output period` + margin. Example, USB mic (10 ms Windows period) → USB headset (10 ms period):
+10 + 10 + 1.5 ≈ **21.5 ms** with the direct engine vs ≈ 32–35 ms with a typical client. Devices with low-latency
+drivers (shown as `LL` in the stats line) get 2.67 ms periods → ≈ 5–6 ms. Wireless headsets add their own radio
+latency on top (often 15–30 ms) — use the headset's built-in hardware sidetone for those if it has one.
+
 **About "zero latency":** no software path is truly zero — audio must be captured in blocks and played in blocks. Typical results: ~3–10 ms with JACK / CoreAudio / exclusive WASAPI on good interfaces; ~15–40 ms in Windows shared mode with many USB headsets (Windows' own engine period is 10 ms per direction for drivers without low-latency support). If your headset has **hardware sidetone** (set in its own app), that one is truly zero-latency and should be preferred.
 
 ## Command line
@@ -46,7 +55,8 @@ Grab the latest build from **[Releases](../../releases/latest)**:
 Sidetone --list                      # list audio APIs, mics and outputs
 Sidetone --headless                  # run without a window using saved settings
     --input "name" --output "name" --period 32 --rate 48000 --gain -6
-    --exclusive | --exclusive-in | --exclusive-out   --backend JACK
+    --exclusive | --exclusive-in | --exclusive-out   --backend JACK   --no-direct
+Sidetone --measure ...               # measure real latency (output must be looped into the mic)
 ```
 
 Settings live in `%APPDATA%\Sidetone\settings.ini` (Windows), `~/Library/Application Support/Sidetone/` (macOS), `~/.config/sidetone/` (Linux).

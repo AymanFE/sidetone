@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
-project(Sidetone VERSION 1.0.0 LANGUAGES C CXX)
+project(Sidetone VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,7 +36,7 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 
-set(SOURCES src/main.cpp src/engine.cpp src/settings.cpp src/miniaudio_impl.c)
+set(SOURCES src/main.cpp src/engine.cpp src/settings.cpp src/wasapi_direct.cpp src/miniaudio_impl.c)
 if(WIN32)
   list(APPEND SOURCES assets/sidetone.rc)
 endif()
@@ -45,6 +45,9 @@ target_include_directories(Sidetone PRIVATE ${miniaudio_SOURCE_DIR})
 target_compile_definitions(Sidetone PRIVATE APP_VERSION="${PROJECT_VERSION}")
 target_link_libraries(Sidetone PRIVATE imgui)
 
+if(WIN32)
+  target_link_libraries(Sidetone PRIVATE ole32 avrt)
+endif()
 if(MSVC)
   target_compile_options(Sidetone PRIVATE /O2 /utf-8)
   target_link_options(Sidetone PRIVATE /ENTRY:mainCRTStartup)

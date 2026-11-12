@@ -1,8 +1,10 @@
 #include "engine.h"
+#include "wasapi_direct.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 static constexpr float kPi = 3.14159265358979f;
 
@@ -12,6 +14,9 @@ Engine::Engine() {}
 
 Engine::~Engine() {
     stop();
+#ifdef _WIN32
+    delete direct_;
+#endif
     if (ctxInit_) ma_context_uninit(&ctx_);
 }
 
@@ -124,9 +129,34 @@ bool Engine::start(const EngineConfig& cfg) {
     hpfCur_ = -1; hz1_ = hz2_ = 0; gateEnv_ = 0; gateGain_ = 1; gateHold_ = 0;
     gainSm_ = muted ? 0.0f : dbToLin(gainDb);
     winMin_ = UINT32_MAX; winFrames_ = 0; dropBudget_ = 0; warm_ = 0; last_ = 0; fillSm_ = 0;
+    tState_ = 0; capFrame_ = 0;
+    if (testState_ == 1) testState_ = 0;
     cushion_ = 0; stableFrames_ = 0; cushionOut_ = 0; lastCapCount_ = 0; sinceCap_ = 0; capCount_ = 0;
-    underruns_ = 0; dropped_ = 0; fillAvg_ = 0;
-    sr_ = cfg.sampleRate;
+    underruns_ = 0; dropped_ = 0; fillAvg_ = 0; minFill_ = 0;
+    sr_ = capSr_ = cfg.sampleRate;
+
+#ifdef _WIN32
+    if (cfg.direct && !cfg.exclusiveIn && !cfg.exclusiveOut && ctx_.backend == ma_backend_wasapi) {
+        if (!direct_) direct_ = new WasapiDirect(this);
+        stopping_ = false;
+        std::string derr;
+        if (direct_->start(inId, outId, derr)) {
+            auto* d = direct_;
+            info_.backend = "WASAPI direct";
+            info_.direct = true;
+            info_.inputName = d->capName;
+            info_.outputName = d->renName;
+            info_.sampleRate = d->renRate;
+            info_.capPeriod = d->capPeriod; info_.capPeriods = 1; info_.capChannels = d->capCh;
+            info_.capInternalRate = d->capRate; info_.capBuffer = d->capBuffer; info_.capLowLatency = d->capLowLatency;
+            info_.playPeriod = d->renPeriod; info_.playPeriods = 1; info_.playChannels = d->renCh;
+            info_.playInternalRate = d->renRate; info_.playBuffer = d->renBuffer; info_.playLowLatency = d->renLowLatency;
+            running_ = true;
+            return true;
+        }
+        info_.note += "Direct engine unavailable (" + derr + "), using standard. ";
+    }
+#endif
 
     // Playback device
     ma_device_config pc = baseConfig(ma_device_type_playback, cfg, this);
@@ -180,6 +210,12 @@ bool Engine::start(const EngineConfig& cfg) {
     info_.playChannels = play_.playback.channels;
     info_.playInternalRate = play_.playback.internalSampleRate;
     info_.playExclusive = play_.playback.shareMode == ma_share_mode_exclusive;
+#if defined(MA_HAS_WASAPI) || defined(_WIN32)
+    if (ctx_.backend == ma_backend_wasapi) {
+        info_.capBuffer = cap_.wasapi.actualBufferSizeInFramesCapture;
+        info_.playBuffer = play_.wasapi.actualBufferSizeInFramesPlayback;
+    }
+#endif
 
     stopping_ = false;
     // Start output first so the mic never builds up a backlog.
@@ -194,17 +230,64 @@ bool Engine::start(const EngineConfig& cfg) {
 
 void Engine::stop() {
     stopping_ = true;
+#ifdef _WIN32
+    if (direct_) direct_->stop();
+#endif
+    if (rsOn_) { ma_linear_resampler_uninit(&rs_, nullptr); rsOn_ = false; }
     if (capInit_) { ma_device_uninit(&cap_); capInit_ = false; }
     if (playInit_) { ma_device_uninit(&play_); playInit_ = false; }
     running_ = false;
 }
 
+void Engine::directPrepare(uint32_t capRate, uint32_t renRate) {
+    capSr_ = capRate;
+    sr_ = renRate;
+    hpfCur_ = -1;
+    if (rsOn_) { ma_linear_resampler_uninit(&rs_, nullptr); rsOn_ = false; }
+    if (capRate != renRate) {
+        ma_linear_resampler_config rc = ma_linear_resampler_config_init(ma_format_f32, 1, capRate, renRate);
+        rsOn_ = ma_linear_resampler_init(&rc, nullptr, &rs_) == MA_SUCCESS;
+    }
+}
+
+void Engine::pushRing(const float* s, uint32_t n) {
+    if (!rsOn_) { dropped_ += ring_.push(s, n); return; }
+    while (n > 0) {
+        ma_uint64 inF = std::min<uint32_t>(n, 1024), outF = sizeof(rsBuf_) / sizeof(float);
+        ma_linear_resampler_process_pcm_frames(&rs_, s, &inF, rsBuf_, &outF);
+        dropped_ += ring_.push(rsBuf_, (uint32_t)outF);
+        if (inF == 0) break;
+        s += inF;
+        n -= (uint32_t)inF;
+    }
+}
+
+uint32_t Engine::outputMargin() const {
+#ifdef _WIN32
+    if (info_.direct && direct_) return direct_->margin.load();
+#endif
+    return 0;
+}
+
+uint64_t Engine::outputGlitches() const {
+#ifdef _WIN32
+    if (info_.direct && direct_) return direct_->renderGlitches.load();
+#endif
+    return 0;
+}
+
 double Engine::estimatedLatencyMs() const {
     if (!running_ || sr_ == 0) return 0.0;
+    if (info_.direct) {
+        double capMs = capSr_ ? info_.capPeriod * 1000.0 / capSr_ : 0.0;
+        return capMs + (minFill_.load() + info_.playPeriod + outputMargin()) * 1000.0 / sr_;
+    }
     // capture period (wait for a block) + ring fill + output buffer queue
     auto toLocal = [&](uint32_t frames, uint32_t rate) { return rate ? (double)frames * sr_ / rate : (double)frames; };
-    double frames = toLocal(info_.capPeriod, info_.capInternalRate) + fillAvg_.load() +
-                    toLocal(info_.playPeriod * std::max(1u, info_.playPeriods), info_.playInternalRate);
+    // miniaudio keeps the whole output buffer full
+    uint32_t outQ = info_.playBuffer ? info_.playBuffer : info_.playPeriod * std::max(1u, info_.playPeriods);
+    double frames = toLocal(info_.capPeriod, info_.capInternalRate) + minFill_.load() +
+                    toLocal(outQ, info_.playInternalRate);
     return frames * 1000.0 / sr_;
 }
 
@@ -222,10 +305,14 @@ void Engine::playCb(ma_device* d, void* out, const void*, ma_uint32 frames) {
 }
 
 void Engine::onCapture(const float* in, uint32_t frames, uint32_t ch) {
-    if (!in || ch == 0) return;
+    if (ch == 0) return;
+    if (testReq_.exchange(false)) {
+        tState_ = 1; tCnt_ = 0; tNoise_ = 0; tRuns_ = 0; tFails_ = 0;
+        testState_ = 1; testRuns_ = 0;
+    }
     lastCapBlock_.store(frames, std::memory_order_relaxed);
     capCount_.fetch_add(1, std::memory_order_relaxed);
-    const float fs = (float)sr_;
+    const float fs = (float)capSr_;
     const float target = muted ? 0.0f : dbToLin(gainDb);
     const int mode = chanMode;
     const bool hpf = hpfOn;
@@ -252,15 +339,22 @@ void Engine::onCapture(const float* in, uint32_t frames, uint32_t ch) {
     uint32_t done = 0;
     while (done < frames) {
         uint32_t n = std::min<uint32_t>(frames - done, 1024);
-        const float* src = in + (size_t)done * ch;
+        static const float kZero[8] = {};
+        const float* src = in ? in + (size_t)done * ch : nullptr;
         for (uint32_t i = 0; i < n; ++i) {
-            const float* fr = src + (size_t)i * ch;
+            const float* fr = src ? src + (size_t)i * ch : kZero;
             float s;
-            if (mode == 1 || ch == 1) s = fr[0];
+            if (ch > 8 && !src) s = 0.0f;
+            else if (mode == 1 || ch == 1) s = fr[0];
             else if (mode == 2) s = fr[1];
             else { s = 0.0f; for (uint32_t c = 0; c < ch; ++c) s += fr[c]; s /= (float)ch; }
             float a = std::fabs(s);
             if (a > inPk) inPk = a;
+            ++capFrame_;
+            if (tState_ != 0) {  // latency test owns the signal path
+                capBuf_[i] = testStep(a);
+                continue;
+            }
             if (hpf) {
                 float y = hb0_ * s + hz1_;
                 hz1_ = hb1_ * s - ha1_ * y + hz2_;
@@ -279,11 +373,60 @@ void Engine::onCapture(const float* in, uint32_t frames, uint32_t ch) {
             gainSm_ += (target - gainSm_) * gainCoef;
             capBuf_[i] = s * gainSm_;
         }
-        dropped_ += ring_.push(capBuf_, n);
+        pushRing(capBuf_, n);
         done += n;
     }
     float prev = inPeak_.load(std::memory_order_relaxed);
     if (inPk > prev) inPeak_.store(inPk, std::memory_order_relaxed);
+}
+
+// Real round-trip measurement. A short tone burst is injected into the sidetone path in place
+// of the mic signal at capture frame N; it travels ring -> output -> (cable/air) -> mic and is
+// detected at capture frame M. (M - N) / rate is exactly the mic-to-ear sidetone latency,
+// measured on a single clock.
+float Engine::testStep(float a) {
+    const uint32_t fs = capSr_;
+    const uint32_t burstLen = fs * 3 / 1000, ramp = std::max<uint32_t>(1, fs / 4000);
+    float out = 0.0f;
+    switch (tState_) {
+    case 1:  // measure background noise
+        tNoise_ = std::max(tNoise_, a);
+        if (++tCnt_ >= fs * 3 / 10) {
+            tThr_ = std::max(0.02f, tNoise_ * 4.0f);
+            if (tThr_ > 0.5f) { tState_ = 0; testState_ = 3; break; }  // too noisy
+            tState_ = 2; tCnt_ = 0; tFire_ = capFrame_;
+        }
+        break;
+    case 2:  // fire + listen
+        if (tCnt_ < burstLen) {
+            float env = std::min({1.0f, (float)tCnt_ / ramp, (float)(burstLen - tCnt_) / ramp});
+            out = 0.7f * env * std::sin(2.0f * kPi * 2000.0f * (float)tCnt_ / (float)fs);
+        }
+        if (a > tThr_ && tCnt_ > 0) {
+            tRes_[tRuns_++] = (float)((double)(capFrame_ - tFire_) * 1000.0 / fs);
+            testRuns_ = tRuns_;
+            tState_ = 3; tCnt_ = 0;
+        } else if (++tCnt_ > fs / 2) {  // nothing came back within 500 ms
+            tFails_++;
+            tState_ = 3; tCnt_ = 0;
+        }
+        break;
+    case 3:  // let it die down
+        if (++tCnt_ >= fs / 4) {
+            if (tRuns_ >= kTestRuns || tFails_ >= 3) {
+                if (tRuns_ >= 3) {
+                    std::sort(tRes_, tRes_ + tRuns_);
+                    testResult_ = tRes_[tRuns_ / 2];
+                    testMin_ = tRes_[0];
+                    testMax_ = tRes_[tRuns_ - 1];
+                    testState_ = 2;
+                } else testState_ = 3;
+                tState_ = 0;
+            } else { tState_ = 2; tCnt_ = 0; tFire_ = capFrame_; }
+        }
+        break;
+    }
+    return out;
 }
 
 void Engine::onPlayback(float* out, uint32_t frames, uint32_t ch) {
@@ -298,7 +441,8 @@ void Engine::onPlayback(float* out, uint32_t frames, uint32_t ch) {
 
 void Engine::playChunk(float* out, uint32_t frames, uint32_t ch) {
     uint32_t avail = ring_.readAvailable();
-    fillSm_ = fillSm_ * 0.99f + (float)avail * 0.01f;
+    // average data left waiting in the ring after this read = added latency
+    fillSm_ = fillSm_ * 0.99f + (float)(avail > frames ? avail - frames : 0) * 0.01f;
     fillAvg_.store(fillSm_, std::memory_order_relaxed);
     if (warm_ < sr_) warm_ += frames;
 
@@ -329,6 +473,7 @@ void Engine::playChunk(float* out, uint32_t frames, uint32_t ch) {
     if (leftover < winMin_) winMin_ = leftover;
     winFrames_ += frames;
     if (winFrames_ >= sr_ / 5) {
+        if (winMin_ != UINT32_MAX) minFill_.store(winMin_, std::memory_order_relaxed);
         dropBudget_ = (winMin_ != UINT32_MAX && winMin_ > target + 2) ? winMin_ - target - 1 : 0;
         winMin_ = UINT32_MAX;
         winFrames_ = 0;
