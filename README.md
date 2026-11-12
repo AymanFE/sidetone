@@ -19,7 +19,9 @@ Grab the latest build from **[Releases](../../releases/latest)**:
 - Pick **any microphone** and **any output** (headset, speakers, virtual cable…), switch live
 - Volume (-40…+24 dB), mute, left/right balance, mic channel select (for one-sided USB mics)
 - **Low-latency engine**
-  - Windows: **direct WASAPI engine** — writes mic audio to the output the instant it's captured and keeps the output queue at exactly *one Windows engine period + ~1.5 ms* (adaptive) instead of a full buffer. Uses IAudioClient3 low-latency periods when the driver supports them. Measured ~10–13 ms less than a normal WASAPI client on the same hardware.
+  - Windows: **direct WASAPI engine** — writes mic audio to the output the instant it's captured and keeps the output queue at exactly *one Windows engine period + an adaptive 0.25–1 ms margin* instead of a full buffer. Uses IAudioClient3 low-latency periods when the driver supports them, and hardware-minimum periods in exclusive mode (with a watchdog that backs off automatically if a device can't keep up).
+  - **Share mic** (Windows): run the mic in *exclusive* mode for the lowest latency and forward it to a virtual cable (e.g. VB-Cable) so Discord/games keep using it via "CABLE Output"
+  - **Live measured latency**: the main number comes from Windows' own audio timestamps (capture time of each sample → when it reaches the speaker), not an estimate
   - **Measure real latency** button: plays a short beep into the sidetone path and times how long it takes to come back through the mic — the true mic-to-ear delay, hardware included
   - miniaudio with low-latency profile, no fixed-size callback buffering, real-time audio threads (MMCSS "Pro Audio" on Windows)
   - Windows: IAudioClient3 low-latency shared mode when the driver supports it, optional **exclusive mode** per device
@@ -40,6 +42,15 @@ Grab the latest build from **[Releases](../../releases/latest)**:
 4. Linux: choose **JACK** as the Audio API (works with PipeWire's JACK layer).
 5. Watch the stats line: *mic block* / *out* show what the driver actually granted.
 
+### Measured on a USB mic + USB headset (fifine SC3), driver timestamps
+
+| Mode | Software latency |
+|---|---|
+| Typical WASAPI app (shared) | ~32–40 ms |
+| Sidetone direct engine, shared | ~25–37 ms (depends on device timing phase) |
+| + Exclusive mic (+ Share mic to VB-Cable for Discord) | **~21 ms** |
+| Exclusive output | **~16 ms** |
+
 ### Where the delay comes from (Windows shared mode)
 
 `mic block` + `output period` + margin. Example, USB mic (10 ms Windows period) → USB headset (10 ms period):
@@ -56,6 +67,7 @@ Sidetone --list                      # list audio APIs, mics and outputs
 Sidetone --headless                  # run without a window using saved settings
     --input "name" --output "name" --period 32 --rate 48000 --gain -6
     --exclusive | --exclusive-in | --exclusive-out   --backend JACK   --no-direct
+    --share-mic "CABLE Input (VB-Audio Virtual Cable)"
 Sidetone --measure ...               # measure real latency (output must be looped into the mic)
 ```
 

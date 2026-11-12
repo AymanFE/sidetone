@@ -22,12 +22,14 @@ struct EngineConfig {
     uint32_t periodFrames = 64;
     bool exclusiveIn = false;
     bool exclusiveOut = false;
-    bool direct = true;  // Windows: use the direct low-latency WASAPI engine for shared mode
+    bool direct = true;  // Windows: use the direct low-latency WASAPI engine
+    std::string forward;  // Windows direct engine: also send the mic to this output ("share mic")
 
     bool operator==(const EngineConfig& o) const {
         return input == o.input && output == o.output && sampleRate == o.sampleRate &&
                periodFrames == o.periodFrames && exclusiveIn == o.exclusiveIn &&
-               exclusiveOut == o.exclusiveOut && direct == o.direct;
+               exclusiveOut == o.exclusiveOut && direct == o.direct &&
+               forward == o.forward;
     }
     bool operator!=(const EngineConfig& o) const { return !(*this == o); }
 };
@@ -41,6 +43,7 @@ struct EngineInfo {
     bool capLowLatency = false, playLowLatency = false;
     uint32_t capBuffer = 0, playBuffer = 0;  // actual driver buffer sizes (WASAPI)
     uint32_t playMargin = 0;
+    std::string forwardName;
 };
 
 // Single-producer / single-consumer lock-free mono float ring buffer.
@@ -68,6 +71,8 @@ public:
         r_.store(r + n, std::memory_order_release);
         return n;
     }
+    uint32_t readIndex() const { return r_.load(std::memory_order_relaxed); }
+    uint32_t writeIndex() const { return w_.load(std::memory_order_relaxed); }
     void skip(uint32_t n) {
         uint32_t r = r_.load(std::memory_order_relaxed);
         uint32_t avail = w_.load(std::memory_order_acquire) - r;
@@ -127,6 +132,8 @@ public:
     uint32_t micBlockFrames() const { return lastCapBlock_.load(); }
     double estimatedLatencyMs() const;
     uint32_t outputMargin() const;
+    float pipelineLatencyMs() const;
+    bool needsQuickRestart() const;  // exclusive output watchdog tripped -> restart with safer settings  // measured from driver timestamps (direct engine), 0 if n/a
     uint64_t outputGlitches() const;
 
     // Measured latency test: loop the output back into the mic (headphone earcup on the mic,

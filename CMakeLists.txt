@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
-project(Sidetone VERSION 1.1.0 LANGUAGES C CXX)
+project(Sidetone VERSION 1.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -40,6 +40,7 @@ static EngineConfig toConfig(const Settings& s) {
     c.exclusiveIn = s.exclusiveIn;
     c.exclusiveOut = s.exclusiveOut;
     c.direct = s.directEngine;
+    c.forward = s.shareMicTo;
     return c;
 }
 
@@ -66,6 +67,7 @@ static void printUsage() {
         "  Sidetone --headless      run without a window (uses saved settings)\n"
         "     --input \"name\"   --output \"name\"   --period N   --rate N\n"
         "  Sidetone --measure       measure real latency (needs output looped back into the mic)\n"
+        "     --share-mic \"output name\"  (send the mic to e.g. VB-Cable so Discord can use it)\n"
         "     --gain dB   --exclusive | --exclusive-in | --exclusive-out   --backend NAME\n");
 }
 
@@ -87,6 +89,7 @@ static int runCli(int argc, char** argv, Settings& s) {
         else if (a == "--exclusive-in") s.exclusiveIn = true;
         else if (a == "--exclusive-out") s.exclusiveOut = true;
         else if (a == "--no-direct") s.directEngine = false;
+        else if (a == "--share-mic") s.shareMicTo = next();
         else { printUsage(); return a == "--help" || a == "-h" ? 0 : 1; }
     }
     auto eng = std::make_unique<Engine>();
@@ -113,6 +116,7 @@ static int runCli(int argc, char** argv, Settings& s) {
     if (!in.note.empty()) std::printf("Note: %s\n", in.note.c_str());
     if (in.playBuffer) std::printf("WASAPI buffers: mic %u fr, out %u fr (rates %u / %u)%s%s\n", in.capBuffer, in.playBuffer,
                                    in.capInternalRate, in.playInternalRate, in.capLowLatency ? " mic-LL" : "", in.playLowLatency ? " out-LL" : "");
+    if (!in.forwardName.empty()) std::printf("Sharing mic to: %s\n", in.forwardName.c_str());
     if (measure) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         eng->startLatencyTest();
@@ -133,9 +137,20 @@ static int runCli(int argc, char** argv, Settings& s) {
     int tick = 0;
     while (!quit) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (eng->deviceLost()) { std::fprintf(stderr, "Device disconnected.\n"); break; }
+        if (eng->deviceLost()) {
+            if (eng->needsQuickRestart()) {
+                std::fprintf(stderr, "Exclusive output too slow on this device - restarting with safer settings.\n");
+                eng->stop();
+                if (!eng->start(toConfig(s))) { std::fprintf(stderr, "Error: %s\n", eng->lastError().c_str()); break; }
+                if (!eng->info().note.empty()) std::printf("Note: %s\n", eng->info().note.c_str());
+                continue;
+            }
+            std::fprintf(stderr, "Device disconnected.\n");
+            break;
+        }
         if (++tick % 20 == 0) {
-            std::printf("latency ~%.2f ms | mic block %u | fill %.0f fr | cushion %u | underruns %llu | trimmed %llu fr | mic peak %.0f dB\n",
+            std::printf("pipeline %.2f ms | margin %u glitches %llu | est ~%.2f ms | mic block %u | fill %.0f fr | cushion %u | underruns %llu | trimmed %llu fr | mic peak %.0f dB\n",
+                        eng->pipelineLatencyMs(), eng->outputMargin(), (unsigned long long)eng->outputGlitches(),
                         eng->estimatedLatencyMs(), eng->micBlockFrames(), eng->avgFillFrames(), eng->cushionFrames(), (unsigned long long)eng->underruns(),
                         (unsigned long long)eng->droppedFrames(), toDb(eng->takeInPeak()));
             std::fflush(stdout);
@@ -146,13 +161,14 @@ static int runCli(int argc, char** argv, Settings& s) {
 }
 
 // ---------------------------------------------------------------- GUI helpers
-static bool deviceCombo(const char* label, std::string& sel, const std::vector<AudioDevice>& devs) {
+static bool deviceCombo(const char* label, std::string& sel, const std::vector<AudioDevice>& devs,
+                        const char* emptyLabel = "System default") {
     bool present = sel.empty();
     for (auto& d : devs) if (d.name == sel) present = true;
-    std::string preview = sel.empty() ? "System default" : (present ? sel : sel + "  (not connected)");
+    std::string preview = sel.empty() ? emptyLabel : (present ? sel : sel + "  (not connected)");
     bool changed = false;
     if (ImGui::BeginCombo(label, preview.c_str())) {
-        if (ImGui::Selectable("System default", sel.empty())) { sel.clear(); changed = true; }
+        if (ImGui::Selectable(emptyLabel, sel.empty())) { sel.clear(); changed = true; }
         for (size_t i = 0; i < devs.size(); ++i) {
             std::string l = devs[i].name + (devs[i].isDefault ? "  [default]" : "") + "##" + std::to_string(i);
             if (ImGui::Selectable(l.c_str(), sel == devs[i].name)) { sel = devs[i].name; changed = true; }
@@ -295,9 +311,10 @@ int main(int argc, char** argv) {
         // ---- engine supervision
         pushParams(eng, s);
         if (eng.running() && eng.deviceLost()) {
+            bool quick = eng.needsQuickRestart();
             eng.stop();
-            status = "Device disconnected";
-            nextRetry = now + 1.5;
+            status = quick ? "Output too slow in exclusive mode - adjusting" : "Device disconnected";
+            nextRetry = quick ? 0 : now + 1.5;
         }
         if (wantRunning && eng.running() && toConfig(s) != eng.config()) {
             eng.stop();
@@ -345,7 +362,8 @@ int main(int argc, char** argv) {
         bool on = eng.running();
         ImGui::TextColored(on ? ImVec4(0.35f, 0.9f, 0.5f, 1) : ImVec4(0.7f, 0.7f, 0.7f, 1), on ? "LIVE" : "OFF");
         ImGui::SameLine();
-        if (on) ImGui::Text("  ~%.1f ms software latency (est.)", eng.estimatedLatencyMs());
+        if (on && eng.pipelineLatencyMs() > 0) ImGui::Text("  %.1f ms software latency (measured)", eng.pipelineLatencyMs());
+        else if (on) ImGui::Text("  ~%.1f ms software latency (est.)", eng.estimatedLatencyMs());
         else ImGui::TextDisabled("  %s", status.c_str());
 
         // Big toggle
@@ -431,7 +449,13 @@ int main(int argc, char** argv) {
         help("Lowest latency: Sidetone takes the output device exclusively.\nWARNING: no other app can play sound on that device while it's on.\nBest with a dedicated output (e.g. a headset's separate 'chat' endpoint).");
 #ifdef _WIN32
         ImGui::Checkbox("Direct WASAPI engine", &s.directEngine);
-        help("Windows shared mode: Sidetone's own WASAPI engine. Keeps the output queue at one\nWindows engine period + ~1.5 ms instead of a full buffer (saves ~5-10 ms) and uses\nWindows' low-latency audio periods when the driver supports them.\nTurn off only if you get problems.");
+        help("Sidetone's own WASAPI engine (recommended). Shared mode: keeps the output queue at one\nWindows engine period + an adaptive ~0.25-1 ms margin instead of a full buffer, and uses\nWindows' low-latency periods when the driver supports them. Exclusive: hardware-minimum periods.\nTurn off only if you get problems.");
+        if (s.directEngine) {
+            row("Share mic to");
+            std::string shareSel = s.shareMicTo;
+            if (deviceCombo("##share", shareSel, eng.outputs(), "Off")) s.shareMicTo = shareSel;
+            help("With 'Exclusive mic' on, other apps can't open your mic.\nPick a virtual cable here (e.g. 'CABLE Input (VB-Audio Virtual Cable)') and set\nDiscord/games to use 'CABLE Output' as their microphone - they keep hearing you\nwhile Sidetone gets the mic at its lowest latency.");
+        }
 #endif
 
         if (on) {
@@ -449,6 +473,7 @@ int main(int argc, char** argv) {
                 ImGui::TextDisabled("ring %.0f fr | cushion %u fr | underruns %llu | trimmed %llu fr", eng.avgFillFrames(),
                                     eng.cushionFrames(), (unsigned long long)eng.underruns(),
                                     (unsigned long long)eng.droppedFrames());
+            if (!in.forwardName.empty()) ImGui::TextDisabled("sharing mic to %s", in.forwardName.c_str());
             if (!in.note.empty()) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%s", in.note.c_str());
         }
 

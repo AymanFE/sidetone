@@ -136,14 +136,30 @@ bool Engine::start(const EngineConfig& cfg) {
     sr_ = capSr_ = cfg.sampleRate;
 
 #ifdef _WIN32
-    if (cfg.direct && !cfg.exclusiveIn && !cfg.exclusiveOut && ctx_.backend == ma_backend_wasapi) {
+    if (cfg.direct && ctx_.backend == ma_backend_wasapi) {
         if (!direct_) direct_ = new WasapiDirect(this);
         stopping_ = false;
         std::string derr;
-        if (direct_->start(inId, outId, derr)) {
+        DirectOptions o;
+        if (inId) { o.in = *inId; o.hasIn = true; }
+        if (outId) { o.out = *outId; o.hasOut = true; }
+        if (!cfg.forward.empty()) {
+            bool f = false;
+            const ma_device_id* fid = findId(outputs_, cfg.forward, f);
+            if (fid && f) { o.fwd = *fid; o.hasFwd = true; }
+            else info_.note += "Share-mic device not found. ";
+        }
+        o.exclusiveIn = cfg.exclusiveIn;
+        o.exclusiveOut = cfg.exclusiveOut;
+        o.preferredRate = cfg.sampleRate;
+        if (direct_->start(o, derr)) {
             auto* d = direct_;
             info_.backend = "WASAPI direct";
             info_.direct = true;
+            info_.note += d->note;
+            info_.capExclusive = d->capExclusive;
+            info_.playExclusive = d->renExclusive;
+            if (d->fwdActive) info_.forwardName = d->fwdName;
             info_.inputName = d->capName;
             info_.outputName = d->renName;
             info_.sampleRate = d->renRate;
@@ -260,6 +276,21 @@ void Engine::pushRing(const float* s, uint32_t n) {
         s += inF;
         n -= (uint32_t)inF;
     }
+}
+
+bool Engine::needsQuickRestart() const {
+#ifdef _WIN32
+    return direct_ && direct_->starved.load();
+#else
+    return false;
+#endif
+}
+
+float Engine::pipelineLatencyMs() const {
+#ifdef _WIN32
+    if (running_ && info_.direct && direct_) return direct_->pipelineMs.load();
+#endif
+    return 0.0f;
 }
 
 uint32_t Engine::outputMargin() const {

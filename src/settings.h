@@ -10,6 +10,7 @@ struct Settings {
     bool exclusiveIn = false;
     bool exclusiveOut = false;
     bool directEngine = true;
+    std::string shareMicTo;
     int safetyFrames = 16;
 
     float gainDb = 0.0f;
