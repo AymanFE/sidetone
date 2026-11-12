@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <memory>
 #include <cstdlib>
 
 static const GUID kSubFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
@@ -240,6 +241,7 @@ bool WasapiDirect::start(const DirectOptions& o, std::string& err) {
     err_.clear();
     note.clear();
     fwdActive = false;
+    loopActive = false;
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     thr_ = std::thread([this, o]() { threadMain(o); });
     while (ready_ == 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -268,6 +270,10 @@ void WasapiDirect::threadMain(DirectOptions o) {
     IAudioCaptureClient* cap = nullptr;
     IAudioRenderClient *ren = nullptr, *fwd = nullptr;
     IAudioClock* clock = nullptr;
+    Side ls;                              // loopback (other apps)
+    IAudioCaptureClient* lcap = nullptr;
+    ma_linear_resampler loopRs{};
+    bool loopRsOn = false;
     HANDLE capEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     HANDLE renEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     HANDLE fwdEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -311,6 +317,26 @@ void WasapiDirect::threadMain(DirectOptions o) {
             } else note += "Share-mic output failed. ";
         }
 
+        if (o.hasLoop) {  // loopback-capture another output so other apps keep playing on this one
+            bool ok = false;
+            if (SUCCEEDED(en->GetDevice((LPCWSTR)o.loop.wasapi, &ls.dev)) &&
+                SUCCEEDED(ls.dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ls.c))) {
+                WAVEFORMATEX* mf = nullptr;
+                if (SUCCEEDED(ls.c->GetMixFormat(&mf))) {
+                    ls.f = fmtFrom(mf);
+                    if (supported(ls.f) && SUCCEEDED(ls.c->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                                                      200000, 0, mf, nullptr)) &&
+                        SUCCEEDED(ls.c->GetService(__uuidof(IAudioCaptureClient), (void**)&lcap))) {
+                        ok = true;
+                        loopActive = true;
+                        loopName = friendlyName(ls.dev);
+                    }
+                    CoTaskMemFree(mf);
+                }
+            }
+            if (!ok) note += "App audio passthrough failed. ";
+        }
+
         capRate = cs.f.rate; renRate = rs.f.rate; capCh = cs.f.ch; renCh = rs.f.ch;
         capPeriod = cs.period; renPeriod = rs.period; capBuffer = cs.buffer; renBuffer = rs.buffer;
         capLowLatency = cs.lowLat; renLowLatency = rs.lowLat; capExclusive = cs.excl; renExclusive = rs.excl;
@@ -319,6 +345,10 @@ void WasapiDirect::threadMain(DirectOptions o) {
 
     if (ready_ == 0) {
         eng_->directPrepare(capRate, renRate);
+        if (loopActive && ls.f.rate != renRate) {
+            ma_linear_resampler_config rc = ma_linear_resampler_config_init(ma_format_f32, 2, ls.f.rate, renRate);
+            loopRsOn = ma_linear_resampler_init(&rc, nullptr, &loopRs) == MA_SUCCESS;
+        }
         if (fwdActive && fs.f.rate != capRate) {
             ma_linear_resampler_config rc = ma_linear_resampler_config_init(ma_format_f32, 1, capRate, fs.f.rate);
             fwdRsOn = ma_linear_resampler_init(&rc, nullptr, &fwdRs) == MA_SUCCESS;
@@ -350,25 +380,107 @@ void WasapiDirect::threadMain(DirectOptions o) {
         LARGE_INTEGER qpf;
         QueryPerformanceFrequency(&qpf);
         LONGLONG lastClockQ = 0;
+        volatile float rawLat = 0.0f;
+        volatile float dbgL1 = 0, dbgL2 = 0;
+        float calD[7] = {};
+        int calN = 0;
+        float outDelay = 0.0f;  // engine + driver output delay beyond our queue (calibrated)
+        volatile bool clockTainted = false;  // an output glitch happened -> clock-based value is off
+        volatile uint32_t rawLatN = 0;
 
         BYTE* buf = nullptr;
         // prime output with silence
-        uint32_t prime = rs.excl ? rs.buffer : std::min<uint32_t>(renPeriod + mg, rs.buffer);
+        // shared: the engine may pull up to two periods right after Start - prime enough that the
+        // stream never starts with a glitch (the surplus drains away by itself in a few ticks)
+        uint32_t prime = rs.excl ? rs.buffer : std::min<uint32_t>(2 * renPeriod + mg, rs.buffer);
         if (SUCCEEDED(ren->GetBuffer(prime, &buf))) { ren->ReleaseBuffer(prime, AUDCLNT_BUFFERFLAGS_SILENT); written += prime; }
         if (fwdActive) fs.c->Start();
+        if (loopActive) ls.c->Start();
         if (FAILED(rs.c->Start()) || FAILED(cs.c->Start())) fail("Start failed");
         else ready_ = 1;
 
+        // ---- other-apps passthrough: stereo ring (main thread pushes, render side pops)
+        auto appRing = std::make_unique<SpscRing>();
+        std::vector<float> loopF(16384), loopTmp(16384), appBuf(16384);
+        uint32_t appWinMin = UINT32_MAX, appWinFrames = 0, appWarm = 0;
+        float appPkAcc = 0.0f;
+        auto drainLoopback = [&]() {
+            if (!loopActive) return;
+            while (true) {
+                UINT32 pkt = 0;
+                if (FAILED(lcap->GetNextPacketSize(&pkt)) || pkt == 0) break;
+                BYTE* data = nullptr; UINT32 n = 0; DWORD flags = 0;
+                if (FAILED(lcap->GetBuffer(&data, &n, &flags, nullptr, nullptr))) break;
+                uint32_t done = 0;
+                while (done < n) {
+                    uint32_t c = std::min<uint32_t>(n - done, 4096);
+                    // to stereo float
+                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT) std::fill(loopF.begin(), loopF.begin() + 2 * c, 0.0f);
+                    else {
+                        const size_t samples = (size_t)c * ls.f.ch;
+                        if (loopTmp.size() < samples) loopTmp.resize(samples);
+                        toFloat(data + (size_t)done * ls.f.ch * ls.f.bytes, loopTmp.data(), samples, ls.f);
+                        for (uint32_t i = 0; i < c; ++i) {
+                            const float* fr = loopTmp.data() + (size_t)i * ls.f.ch;
+                            loopF[2 * i] = fr[0];
+                            loopF[2 * i + 1] = ls.f.ch > 1 ? fr[1] : fr[0];
+                        }
+                    }
+                    if (loopRsOn) {
+                        ma_uint64 inN = c, outN = 8000;
+                        ma_linear_resampler_process_pcm_frames(&loopRs, loopF.data(), &inN, loopF.data() + 8192, &outN);
+                        appRing->push(loopF.data() + 8192, (uint32_t)outN * 2);
+                    } else appRing->push(loopF.data(), c * 2);
+                    done += c;
+                }
+                lcap->ReleaseBuffer(n);
+            }
+        };
+        // mixes n frames of app audio into an interleaved float buffer (render side)
+        auto mixApps = [&](float* dst, uint32_t n, uint32_t ch) {
+            if (!loopActive) return;
+            uint32_t avail = appRing->readAvailable() / 2;
+            // drift/backlog: keep at most ~one loopback packet (10 ms) + 5 ms queued
+            if (avail < appWinMin) appWinMin = avail;
+            appWinFrames += n;
+            if (appWinFrames >= renRate / 2) {
+                uint32_t keep = renRate * 15 / 1000;
+                if (appWinMin != UINT32_MAX && appWinMin > keep) { appRing->skip((appWinMin - keep) * 2); avail -= appWinMin - keep; }
+                appWinMin = UINT32_MAX; appWinFrames = 0;
+            }
+            if (appWarm < renRate / 50) { appWarm += n; return; }  // let ~20 ms build up first
+            uint32_t got = appRing->pop(appBuf.data(), std::min<uint32_t>(n, avail) * 2) / 2;
+            const float g = eng_->appsMuted.load() ? 0.0f : std::pow(10.0f, eng_->appsGainDb.load() / 20.0f);
+            for (uint32_t i = 0; i < got; ++i) {
+                float l = appBuf[2 * i] * g, r = appBuf[2 * i + 1] * g;
+                float* fr = dst + (size_t)i * ch;
+                if (ch == 1) fr[0] += 0.5f * (l + r);
+                else { fr[0] += l; fr[1] += r; }
+                appPkAcc = std::max(appPkAcc, std::max(std::fabs(l), std::fabs(r)));
+            }
+            if (got < n && avail == 0) appWarm = 0;  // ran dry: rebuild a little cushion
+            if (appPkAcc > appsPeak.load(std::memory_order_relaxed)) appsPeak = appPkAcc;
+            appPkAcc = 0.0f;
+        };
+
         uint64_t dbgTicks = 0, dbgFail = 0, dbgFrames = 0;
         HRESULT dbgHr = S_OK;
+        // stream latency reported by the driver/engine for the output (constant per stream)
+        REFERENCE_TIME renStreamLat = 0;
+        rs.c->GetStreamLatency(&renStreamLat);
         auto writeRender = [&](uint32_t n) {
             if (n == 0) return;
+            UINT32 padBefore = 0;
+            if (!rs.excl) rs.c->GetCurrentPadding(&padBefore);
+            LARGE_INTEGER wq;
+            QueryPerformanceCounter(&wq);
             HRESULT gh = ren->GetBuffer(n, &buf);
             if (FAILED(gh)) { dbgFail++; dbgHr = gh; return; }
             dbgFrames += n;
             const uint32_t R = eng_->ring_.readIndex();  // ring index of the first sample written now
             float* dst = rs.f.isFloat ? (float*)buf : renF.data();
             eng_->directRender(dst, n, rs.f.ch);
+            mixApps(dst, n, rs.f.ch);
             if (!rs.f.isFloat) fromFloat(renF.data(), buf, (size_t)n * rs.f.ch, rs.f);
             ren->ReleaseBuffer(n, 0);
             // IAudioClock::GetPosition can take milliseconds on USB devices (it may ask the
@@ -387,9 +499,32 @@ void WasapiDirect::threadMain(DirectOptions o) {
                             double capT = (double)p.qpc + d * 1e7 / renRate;  // 100 ns units
                             double playT = (double)qpc + ((double)written / renRate - (double)pos / clockFreq) * 1e7;
                             float l = (float)((playT - capT) / 1e4);
-                            if (l > 0.0f && l < 1000.0f) {
-                                latSm = latSm == 0.0f ? l : latSm * 0.8f + l * 0.2f;
+                            // glitch-proof variant: write time + queued frames + engine/driver latency
+                            double wT = (double)wq.QuadPart * 1e7 / qpf.QuadPart;
+                            double playT2 = wT + (double)padBefore * 1e7 / renRate + (double)renStreamLat;
+                            float l2 = (float)((playT2 - capT) / 1e4);
+                            dbgL1 = l; dbgL2 = l2;
+                            // The clock-based value includes the engine/driver output delay but drops
+                            // by the length of any output glitch (the device clock keeps running over
+                            // the gap). Calibrate that fixed delay once on a clean start, then track
+                            // with the glitch-proof queue-based value.
+                            // calibrate only on a provably clean stream, after it has settled (~1 s)
+                            if (calN < 7 && !clockTainted && written > (uint64_t)renRate) {
+                                calD[calN++] = l - l2;
+                                if (calN == 7) { std::sort(calD, calD + 7); outDelay = calD[3]; }
+                            }
+                            if (calN < 7 && clockTainted && !rs.excl) {
+                                // no clean reference: assume the typical shared-mode engine delay
+                                // (one engine period + device buffer ~ 2 periods)
+                                outDelay = 2.0f * renPeriod * 1000.0f / renRate;
+                                calN = 7;
+                            }
+                            float lat = calN >= 7 ? l2 + outDelay : -1.0f;  // -1: still calibrating
+                            if (lat > 0.0f && lat < 1000.0f) {
+                                latSm = latSm == 0.0f ? lat : latSm * 0.8f + lat * 0.2f;
                                 pipelineMs = latSm;
+                                rawLat = lat;
+                                rawLatN = rawLatN + 1;
                             }
                             break;
                         }
@@ -441,8 +576,9 @@ void WasapiDirect::threadMain(DirectOptions o) {
         uint64_t renderTicks = 0, cleanFrames = 0;
         int timeouts = 0;
         if (rs.excl) evs[1] = capEv;  // main loop only services the mic (index 2 duplicate is harmless)
+
         while (ready_ == 1) {
-            DWORD w = WaitForMultipleObjects(rs.excl ? 2 : nEv, evs, FALSE, 250);
+            DWORD w = WaitForMultipleObjects(rs.excl ? 2 : 3, evs, FALSE, 250);
             if (w == WAIT_OBJECT_0) break;
             if (w == WAIT_TIMEOUT) {
                 if (++timeouts >= 8) { eng_->directLost(); break; }
@@ -516,6 +652,7 @@ void WasapiDirect::threadMain(DirectOptions o) {
                 cap->ReleaseBuffer(n);
             }
             if (lost) { eng_->directLost(); break; }
+            drainLoopback();
 
             const bool renderTick = (w == WAIT_OBJECT_0 + 1);
             if (rs.excl) continue;  // exclusive render runs on its own thread
@@ -525,6 +662,7 @@ void WasapiDirect::threadMain(DirectOptions o) {
             if (FAILED(rs.c->GetCurrentPadding(&pad))) { eng_->directLost(); break; }
             if (renderTick) {
                 ++renderTicks;
+                if (pad == 0) clockTainted = true;
                 if (pad == 0 && renderTicks > 20) {  // engine ran dry -> grow margin
                     renderGlitches++;
                     mg = std::min<uint32_t>(mg + ms, maxMargin);
@@ -535,13 +673,14 @@ void WasapiDirect::threadMain(DirectOptions o) {
                 }
                 margin = mg;
             }
-            uint32_t target = std::min<uint32_t>(renPeriod + mg, rs.buffer);
-            uint32_t need = pad < target ? target - pad : 0;
-            uint32_t n = renderTick ? need : std::min<uint32_t>(need, eng_->directAvailable());
-            writeRender(n);
+            const uint32_t target = std::min<uint32_t>(renPeriod + mg, rs.buffer);
+            const uint32_t need = pad < target ? target - pad : 0;
+            writeRender(renderTick ? need : std::min<uint32_t>(need, eng_->directAvailable()));
         }
         if (std::getenv("SIDETONE_DEBUG")) {
             UINT32 pd = 0; rs.c->GetCurrentPadding(&pd);
+            fprintf(stderr, "[direct] clock-based %.2f ms, padding-based %.2f ms (+cal %.2f = %.2f), streamLatency %.2f ms\n", dbgL1, dbgL2, outDelay, dbgL2 + outDelay, renStreamLat / 1e4);
+            fprintf(stderr, "[direct] margin %u, clock tainted %d\n", mg, (int)clockTainted);
             fprintf(stderr, "[direct] renderTicks=%llu fails=%llu lastHr=0x%08lx frames=%llu buffer=%u pad=%u fmt=%u/%uch/%ub/%s\n",
                     (unsigned long long)dbgTicks, (unsigned long long)dbgFail, (unsigned long)dbgHr, (unsigned long long)dbgFrames,
                     rs.buffer, pd, rs.f.rate, rs.f.ch, rs.f.bytes * 8, rs.f.isFloat ? "f" : "i");
@@ -550,9 +689,13 @@ void WasapiDirect::threadMain(DirectOptions o) {
         rs.c->Stop();
         cs.c->Stop();
         if (fwdActive) fs.c->Stop();
+        if (loopActive) ls.c->Stop();
     }
 
     if (fwdRsOn) ma_linear_resampler_uninit(&fwdRs, nullptr);
+    if (loopRsOn) ma_linear_resampler_uninit(&loopRs, nullptr);
+    safeRelease(lcap);
+    ls.release();
     if (avrt) AvRevertMmThreadCharacteristics(avrt);
     safeRelease(clock); safeRelease(cap); safeRelease(ren); safeRelease(fwd);
     cs.release(); rs.release(); fs.release();

@@ -36,6 +36,9 @@ std::string Settings::serialize() const {
       << "exclusive_out=" << exclusiveOut << "\n"
       << "direct_engine=" << directEngine << "\n"
       << "share_mic_to=" << shareMicTo << "\n"
+      << "apps_from=" << appsFrom << "\n"
+      << "apps_gain_db=" << appsGainDb << "\n"
+      << "apps_muted=" << appsMuted << "\n"
       << "safety_frames=" << safetyFrames << "\n"
       << "gain_db=" << gainDb << "\n"
       << "muted=" << muted << "\n"
@@ -71,6 +74,9 @@ void Settings::parse(const std::string& text) {
         else if (k == "exclusive_out") B(exclusiveOut);
         else if (k == "direct_engine") B(directEngine);
         else if (k == "share_mic_to") shareMicTo = v;
+        else if (k == "apps_from") appsFrom = v;
+        else if (k == "apps_gain_db") F(appsGainDb);
+        else if (k == "apps_muted") B(appsMuted);
         else if (k == "safety_frames") I(safetyFrames);
         else if (k == "gain_db") F(gainDb);
         else if (k == "muted") B(muted);

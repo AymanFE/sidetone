@@ -41,6 +41,7 @@ static EngineConfig toConfig(const Settings& s) {
     c.exclusiveOut = s.exclusiveOut;
     c.direct = s.directEngine;
     c.forward = s.shareMicTo;
+    c.appsFrom = s.appsFrom;
     return c;
 }
 
@@ -54,6 +55,8 @@ static void pushParams(Engine& e, const Settings& s) {
     e.gateOn = s.gate;
     e.gateDb = s.gateDb;
     e.safetyFrames = (uint32_t)std::max(0, s.safetyFrames);
+    e.appsGainDb = s.appsGainDb;
+    e.appsMuted = s.appsMuted;
 }
 
 static float toDb(float lin) { return lin > 1e-6f ? 20.0f * std::log10(lin) : -120.0f; }
@@ -68,17 +71,20 @@ static void printUsage() {
         "     --input \"name\"   --output \"name\"   --period N   --rate N\n"
         "  Sidetone --measure       measure real latency (needs output looped back into the mic)\n"
         "     --share-mic \"output name\"  (send the mic to e.g. VB-Cable so Discord can use it)\n"
+        "     --apps-from \"output name\"  (with exclusive output: play everything from that output too)\n"
         "     --gain dB   --exclusive | --exclusive-in | --exclusive-out   --backend NAME\n");
 }
 
 static int runCli(int argc, char** argv, Settings& s) {
     bool list = false, headless = false, measure = false;
+    int phaseTest = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--list") list = true;
         else if (a == "--headless") headless = true;
         else if (a == "--measure") measure = headless = true;
+        else if (a == "--phase-test") { phaseTest = std::atoi(next().c_str()); headless = true; }
         else if (a == "--input") s.input = next();
         else if (a == "--output") s.output = next();
         else if (a == "--period") s.periodFrames = std::atoi(next().c_str());
@@ -90,6 +96,7 @@ static int runCli(int argc, char** argv, Settings& s) {
         else if (a == "--exclusive-out") s.exclusiveOut = true;
         else if (a == "--no-direct") s.directEngine = false;
         else if (a == "--share-mic") s.shareMicTo = next();
+        else if (a == "--apps-from") s.appsFrom = next();
         else { printUsage(); return a == "--help" || a == "-h" ? 0 : 1; }
     }
     auto eng = std::make_unique<Engine>();
@@ -104,6 +111,16 @@ static int runCli(int argc, char** argv, Settings& s) {
         if (!headless) return 0;
     }
     pushParams(*eng, s);
+    for (int i = 0; i < phaseTest; ++i) {  // dev: how much does pipeline latency vary per (re)start?
+        if (!eng->start(toConfig(s))) { std::fprintf(stderr, "Error: %s\n", eng->lastError().c_str()); return 1; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        std::printf("start %d: pipeline %.2f ms  glitches %llu  fill %.0f cushion %u margin %u under %llu trim %llu\n", i + 1, eng->pipelineLatencyMs(),
+                    (unsigned long long)eng->outputGlitches(), eng->avgFillFrames(), eng->cushionFrames(),
+                    eng->outputMargin(), (unsigned long long)eng->underruns(), (unsigned long long)eng->droppedFrames());
+        std::fflush(stdout);
+        eng->stop();
+    }
+    if (phaseTest) return 0;
     if (!eng->start(toConfig(s))) {
         std::fprintf(stderr, "Error: %s\n", eng->lastError().c_str());
         return 1;
@@ -117,6 +134,7 @@ static int runCli(int argc, char** argv, Settings& s) {
     if (in.playBuffer) std::printf("WASAPI buffers: mic %u fr, out %u fr (rates %u / %u)%s%s\n", in.capBuffer, in.playBuffer,
                                    in.capInternalRate, in.playInternalRate, in.capLowLatency ? " mic-LL" : "", in.playLowLatency ? " out-LL" : "");
     if (!in.forwardName.empty()) std::printf("Sharing mic to: %s\n", in.forwardName.c_str());
+    if (!in.appsName.empty()) std::printf("Playing other apps from: %s\n", in.appsName.c_str());
     if (measure) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         eng->startLatencyTest();
@@ -149,8 +167,8 @@ static int runCli(int argc, char** argv, Settings& s) {
             break;
         }
         if (++tick % 20 == 0) {
-            std::printf("pipeline %.2f ms | margin %u glitches %llu | est ~%.2f ms | mic block %u | fill %.0f fr | cushion %u | underruns %llu | trimmed %llu fr | mic peak %.0f dB\n",
-                        eng->pipelineLatencyMs(), eng->outputMargin(), (unsigned long long)eng->outputGlitches(),
+            std::printf("apps peak %.0f dB | pipeline %.2f ms | margin %u glitches %llu | est ~%.2f ms | mic block %u | fill %.0f fr | cushion %u | underruns %llu | trimmed %llu fr | mic peak %.0f dB\n",
+                        toDb(eng->takeAppsPeak()), eng->pipelineLatencyMs(), eng->outputMargin(), (unsigned long long)eng->outputGlitches(),
                         eng->estimatedLatencyMs(), eng->micBlockFrames(), eng->avgFillFrames(), eng->cushionFrames(), (unsigned long long)eng->underruns(),
                         (unsigned long long)eng->droppedFrames(), toDb(eng->takeInPeak()));
             std::fflush(stdout);
@@ -455,6 +473,18 @@ int main(int argc, char** argv) {
             std::string shareSel = s.shareMicTo;
             if (deviceCombo("##share", shareSel, eng.outputs(), "Off")) s.shareMicTo = shareSel;
             help("With 'Exclusive mic' on, other apps can't open your mic.\nPick a virtual cable here (e.g. 'CABLE Input (VB-Audio Virtual Cable)') and set\nDiscord/games to use 'CABLE Output' as their microphone - they keep hearing you\nwhile Sidetone gets the mic at its lowest latency.");
+            row("Play apps from");
+            std::string appsSel = s.appsFrom;
+            if (deviceCombo("##apps", appsSel, eng.outputs(), "Off")) s.appsFrom = appsSel;
+            help("Use with 'Exclusive output' (the biggest latency win: ~20 ms less).\nExclusive output normally silences every other app on your headset. Set Windows'\ndefault output to another device (e.g. 'Speakers (Realtek)' - nothing has to be plugged in)\nand pick it here: Sidetone plays everything from it on your headset too.");
+            if (!s.appsFrom.empty()) {
+                row("Apps volume");
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - helpW - 80 * uiScale);
+                ImGui::SliderFloat("##appsvol", &s.appsGainDb, -40.0f, 12.0f, "%+.1f dB");
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) s.appsGainDb = 0;
+                ImGui::SameLine();
+                ImGui::Checkbox("Mute##apps", &s.appsMuted);
+            }
         }
 #endif
 
@@ -474,6 +504,7 @@ int main(int argc, char** argv) {
                                     eng.cushionFrames(), (unsigned long long)eng.underruns(),
                                     (unsigned long long)eng.droppedFrames());
             if (!in.forwardName.empty()) ImGui::TextDisabled("sharing mic to %s", in.forwardName.c_str());
+            if (!in.appsName.empty()) ImGui::TextDisabled("playing apps from %s", in.appsName.c_str());
             if (!in.note.empty()) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%s", in.note.c_str());
         }
 

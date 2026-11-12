@@ -149,6 +149,12 @@ bool Engine::start(const EngineConfig& cfg) {
             if (fid && f) { o.fwd = *fid; o.hasFwd = true; }
             else info_.note += "Share-mic device not found. ";
         }
+        if (!cfg.appsFrom.empty()) {
+            bool f = false;
+            const ma_device_id* lid = findId(outputs_, cfg.appsFrom, f);
+            if (lid && f) { o.loop = *lid; o.hasLoop = true; }
+            else info_.note += "App-audio device not found. ";
+        }
         o.exclusiveIn = cfg.exclusiveIn;
         o.exclusiveOut = cfg.exclusiveOut;
         o.preferredRate = cfg.sampleRate;
@@ -160,6 +166,7 @@ bool Engine::start(const EngineConfig& cfg) {
             info_.capExclusive = d->capExclusive;
             info_.playExclusive = d->renExclusive;
             if (d->fwdActive) info_.forwardName = d->fwdName;
+            if (d->loopActive) info_.appsName = d->loopName;
             info_.inputName = d->capName;
             info_.outputName = d->renName;
             info_.sampleRate = d->renRate;
@@ -276,6 +283,13 @@ void Engine::pushRing(const float* s, uint32_t n) {
         s += inF;
         n -= (uint32_t)inF;
     }
+}
+
+float Engine::takeAppsPeak() {
+#ifdef _WIN32
+    if (direct_) return direct_->appsPeak.exchange(0.0f);
+#endif
+    return 0.0f;
 }
 
 bool Engine::needsQuickRestart() const {
@@ -471,6 +485,11 @@ void Engine::onPlayback(float* out, uint32_t frames, uint32_t ch) {
 }
 
 void Engine::playChunk(float* out, uint32_t frames, uint32_t ch) {
+    if (resetReq_.exchange(false)) {
+        cushion_ = 0; stableFrames_ = 0; winMin_ = UINT32_MAX; winFrames_ = 0; dropBudget_ = 0;
+        warm_ = 0;  // ignore underruns for a moment while the new stream settles
+        underruns_ = 0;
+    }
     uint32_t avail = ring_.readAvailable();
     // average data left waiting in the ring after this read = added latency
     fillSm_ = fillSm_ * 0.99f + (float)(avail > frames ? avail - frames : 0) * 0.01f;
@@ -484,15 +503,17 @@ void Engine::playChunk(float* out, uint32_t frames, uint32_t ch) {
 
     // Adaptive jitter cushion: grows on underruns, shrinks back while stable.
     if (avail < frames && warm_ >= sr_ / 4 && inputAlive) {
+        // grow gently: at most ~2 ms per underrun, so one stray hiccup can't add a big permanent delay
         uint32_t maxCushion = 2 * std::max(lastCapBlock_.load(std::memory_order_relaxed), frames) + 64;
-        cushion_ = std::min<uint32_t>(cushion_ + (frames - avail) + 8, maxCushion);
+        uint32_t step = std::min<uint32_t>(frames - avail, sr_ / 500) + 8;
+        cushion_ = std::min<uint32_t>(cushion_ + step, maxCushion);
         stableFrames_ = 0;
         underruns_++;
     } else {
         stableFrames_ += frames;
-        if (stableFrames_ >= sr_ * 5 && cushion_ > 0) {  // after 5 s clean: shrink ~3% per second
-            cushion_ -= std::max<uint32_t>(1, cushion_ / 32);
-            stableFrames_ = sr_ * 4;
+        if (stableFrames_ >= sr_ * 3 && cushion_ > 0) {  // after 3 s clean: shrink ~10% every 0.5 s
+            cushion_ -= std::max<uint32_t>(1, cushion_ / 10);
+            stableFrames_ = sr_ * 5 / 2;
         }
     }
     cushionOut_.store(cushion_, std::memory_order_relaxed);

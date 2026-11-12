@@ -42,14 +42,25 @@ Grab the latest build from **[Releases](../../releases/latest)**:
 4. Linux: choose **JACK** as the Audio API (works with PipeWire's JACK layer).
 5. Watch the stats line: *mic block* / *out* show what the driver actually granted.
 
-### Measured on a USB mic + USB headset (fifine SC3), driver timestamps
+### Measured on a USB mic + USB headset (fifine SC3), from WASAPI timestamps
 
-| Mode | Software latency |
+| Mode | Mic → ear (software path) |
 |---|---|
-| Typical WASAPI app (shared) | ~32–40 ms |
-| Sidetone direct engine, shared | ~25–37 ms (depends on device timing phase) |
-| + Exclusive mic (+ Share mic to VB-Cable for Discord) | **~21 ms** |
-| Exclusive output | **~16 ms** |
+| Shared mode | ~32–40 ms (Windows: ~15 ms mic engine + ~20 ms output engine) |
+| Exclusive mic | ~30 ms |
+| **Exclusive output** (+ *Play apps from* so games/Discord still play) | **~16 ms** |
+
+The live number in the app is calibrated against the output clock on a glitch-free start and then tracked from the
+queue, so it can't be fooled by dropouts.
+
+### Lowest-latency setup on Windows (keeps all your other audio)
+
+1. In Windows Sound settings set the **default output** to a spare device — e.g. *Speakers (Realtek)* (nothing has to be plugged in).
+2. In Sidetone: **Output** = your headset, tick **Exclusive output**, **Play apps from** = that spare device.
+   Everything Windows plays (games, Discord, music) is mixed into your headset by Sidetone; adjust it with *Apps volume*.
+3. Optional: **Exclusive mic** + **Share mic to** = *CABLE Input (VB-Audio Virtual Cable)*, and pick *CABLE Output* as the mic in Discord/games.
+
+If Sidetone is closed, other apps keep playing to the spare device — switch the Windows default back to your headset.
 
 ### Where the delay comes from (Windows shared mode)
 

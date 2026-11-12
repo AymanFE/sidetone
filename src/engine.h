@@ -24,12 +24,13 @@ struct EngineConfig {
     bool exclusiveOut = false;
     bool direct = true;  // Windows: use the direct low-latency WASAPI engine
     std::string forward;  // Windows direct engine: also send the mic to this output ("share mic")
+    std::string appsFrom;  // Windows direct engine: mix in everything playing on this output (loopback)
 
     bool operator==(const EngineConfig& o) const {
         return input == o.input && output == o.output && sampleRate == o.sampleRate &&
                periodFrames == o.periodFrames && exclusiveIn == o.exclusiveIn &&
                exclusiveOut == o.exclusiveOut && direct == o.direct &&
-               forward == o.forward;
+               forward == o.forward && appsFrom == o.appsFrom;
     }
     bool operator!=(const EngineConfig& o) const { return !(*this == o); }
 };
@@ -43,7 +44,7 @@ struct EngineInfo {
     bool capLowLatency = false, playLowLatency = false;
     uint32_t capBuffer = 0, playBuffer = 0;  // actual driver buffer sizes (WASAPI)
     uint32_t playMargin = 0;
-    std::string forwardName;
+    std::string forwardName, appsName;
 };
 
 // Single-producer / single-consumer lock-free mono float ring buffer.
@@ -121,6 +122,9 @@ public:
     std::atomic<bool> gateOn{false};
     std::atomic<float> gateDb{-50.0f};
     std::atomic<uint32_t> safetyFrames{16};
+    std::atomic<float> appsGainDb{0.0f};  // passthrough volume for other apps' audio
+    std::atomic<bool> appsMuted{false};
+    float takeAppsPeak();
 
     // Stats
     float takeInPeak() { return inPeak_.exchange(0.0f); }
@@ -133,7 +137,8 @@ public:
     double estimatedLatencyMs() const;
     uint32_t outputMargin() const;
     float pipelineLatencyMs() const;
-    bool needsQuickRestart() const;  // exclusive output watchdog tripped -> restart with safer settings  // measured from driver timestamps (direct engine), 0 if n/a
+    bool needsQuickRestart() const;
+  // exclusive output watchdog tripped -> restart with safer settings  // measured from driver timestamps (direct engine), 0 if n/a
     uint64_t outputGlitches() const;
 
     // Measured latency test: loop the output back into the mic (headphone earcup on the mic,
@@ -160,6 +165,9 @@ private:
     void directRender(float* out, uint32_t frames, uint32_t ch) { onPlayback(out, frames, ch); }
     uint32_t directAvailable() const { return ring_.readAvailable(); }
     void directLost() { lost_ = true; }
+    // forget learned jitter cushion / drift state (after a deliberate stream restart)
+    void directResetAdaptive() { resetReq_ = true; }
+    std::atomic<bool> resetReq_{false};
     WasapiDirect* direct_ = nullptr;
     uint32_t capSr_ = 48000;
     bool rsOn_ = false;

@@ -15,8 +15,8 @@
 class Engine;
 
 struct DirectOptions {
-    bool hasIn = false, hasOut = false, hasFwd = false;
-    ma_device_id in{}, out{}, fwd{};
+    bool hasIn = false, hasOut = false, hasFwd = false, hasLoop = false;
+    ma_device_id in{}, out{}, fwd{}, loop{};  // loop: output whose sound (other apps) is mixed in
     bool exclusiveIn = false, exclusiveOut = false;
     uint32_t preferredRate = 48000;
 };
@@ -32,8 +32,10 @@ public:
     uint32_t capRate = 0, renRate = 0, capCh = 0, renCh = 0;
     uint32_t capPeriod = 0, renPeriod = 0, capBuffer = 0, renBuffer = 0;
     bool capLowLatency = false, renLowLatency = false, capExclusive = false, renExclusive = false;
-    bool fwdActive = false;
-    std::string capName, renName, fwdName, note;
+    bool fwdActive = false, loopActive = false;
+    std::string capName, renName, fwdName, loopName, note;
+    std::atomic<float> appsGain{1.0f};      // linear gain for the mixed-in app audio
+    std::atomic<float> appsPeak{0.0f};
     std::atomic<uint32_t> margin{0};  // render safety margin (frames, shared mode)
     std::atomic<uint64_t> renderGlitches{0};
     std::atomic<float> pipelineMs{0};  // measured from WASAPI timestamps (capture -> playback)

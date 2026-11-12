@@ -11,6 +11,9 @@ struct Settings {
     bool exclusiveOut = false;
     bool directEngine = true;
     std::string shareMicTo;
+    std::string appsFrom;
+    float appsGainDb = 0.0f;
+    bool appsMuted = false;
     int safetyFrames = 16;
 
     float gainDb = 0.0f;
