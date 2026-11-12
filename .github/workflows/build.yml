@@ -1,0 +1,69 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-latest
+            name: macos-universal
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev libgl1-mesa-dev
+
+      - name: Configure
+        run: |
+          EXTRA=""
+          if [ "$RUNNER_OS" = "macOS" ]; then EXTRA='-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $EXTRA
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          case "$RUNNER_OS" in
+            Windows)
+              cp build/Release/Sidetone.exe dist/
+              (cd dist && 7z a ../Sidetone-${{ matrix.name }}.zip Sidetone.exe) ;;
+            macOS)
+              codesign --force --deep -s - build/Sidetone.app
+              ditto -c -k --keepParent build/Sidetone.app Sidetone-${{ matrix.name }}.zip ;;
+            Linux)
+              tar czf Sidetone-${{ matrix.name }}.tar.gz -C build Sidetone ;;
+          esac
+          ls -la Sidetone-*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sidetone-${{ matrix.name }}
+          path: Sidetone-${{ matrix.name }}.*
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Sidetone-${{ matrix.name }}.*

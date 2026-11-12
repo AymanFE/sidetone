@@ -1,0 +1,6 @@
+build/
+build-*/
+dist/
+.vscode/
+.idea/
+*.user
